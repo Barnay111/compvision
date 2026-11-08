@@ -1,32 +1,45 @@
+import itertools
+import json
 import os
+import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 
+# RTSP over TCP: UDP drops packets on busy networks and the picture "smears". Must be set before cv2 opens a stream.
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+
 import cv2
 import numpy as np
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response
+from flask import Flask, Response, abort, jsonify
 from ultralytics import YOLO
 from ultralytics.trackers.utils.reid import ReID, smooth_feature
 
 load_dotenv()
 
+MODULE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+
 # Configuration
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8002")
 BRANCH_ID = int(os.getenv("BRANCH_ID", "1"))
+# Cameras are listed in CAMERAS_FILE (see cameras.example.json). Without it a single camera RTSP_URL is used.
+CAMERAS_FILE = os.getenv("CAMERAS_FILE", os.path.join(MODULE_DIR, "cameras.json"))
 RTSP_URL = os.getenv("RTSP_URL", "0")  # 0 for webcam
 STREAM_PORT = int(os.getenv("STREAM_PORT", "5002"))
 MODEL_PATH = os.getenv("MODEL_PATH", "yolo26s.pt")
-TRACKER_CONFIG = os.getenv(
-    "TRACKER_CONFIG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trackers", "botsort_cctv.yaml")
-)
+TRACKER_CONFIG = os.getenv("TRACKER_CONFIG", os.path.join(MODULE_DIR, "trackers", "botsort_cctv.yaml"))
 SHOW_WINDOW = os.getenv("SHOW_WINDOW", "1") == "1"
 
-# Line crossing settings
+# Live streams: reconnect with exponential backoff up to this many seconds between attempts.
+RECONNECT_MAX_SEC = float(os.getenv("RECONNECT_MAX_SEC", "30"))
+# How long a hung stream may block open()/read() before we treat it as lost.
+STREAM_TIMEOUT_MS = int(os.getenv("STREAM_TIMEOUT_MS", "10000"))
+
+# Line crossing settings (LINE_Y is the default for cameras that don't set their own line_y)
 LINE_Y = int(os.getenv("LINE_Y", "300"))
 # Hysteresis: a person must move this many px past the line to count as being on the other side.
 LINE_MARGIN = int(os.getenv("LINE_MARGIN", "15"))
@@ -50,7 +63,62 @@ REID_STITCH_SEC = float(os.getenv("REID_STITCH_SEC", "10"))
 REID_STITCH_THRESH = float(os.getenv("REID_STITCH_THRESH", "0.72"))
 PERSON_FORGET_SEC = 120.0  # drop state of people not seen this long
 
-model = YOLO(MODEL_PATH)
+
+@dataclass
+class CameraConfig:
+    id: str
+    url: str
+    name: str
+    branch_id: int
+    line_y: int
+    enter_side: str  # "below" or "above": the side of the line that is "inside" (entering = crossing into it)
+
+
+def _resolve_url(url: str):
+    """Relative video file paths are looked up next to cv_module, so the cwd doesn't matter."""
+    if "://" in url or url.isdigit() or os.path.isabs(url) or os.path.isfile(url):
+        return url
+    candidate = os.path.join(MODULE_DIR, url)
+    return os.path.normpath(candidate) if os.path.isfile(candidate) else url
+
+
+def load_cameras():
+    if not os.path.isfile(CAMERAS_FILE):
+        return [CameraConfig(id="cam1", url=RTSP_URL, name="Camera 1", branch_id=BRANCH_ID,
+                             line_y=LINE_Y, enter_side="below")]
+    with open(CAMERAS_FILE) as f:
+        raw = json.load(f)
+    cameras = []
+    for i, c in enumerate(raw, 1):
+        if c.get("enabled", True) is False:
+            continue
+        enter_side = c.get("enter_side", "below")
+        if enter_side not in ("below", "above"):
+            raise ValueError(f"camera {c.get('id')}: enter_side must be 'below' or 'above'")
+        cameras.append(CameraConfig(
+            id=str(c.get("id", f"cam{i}")),
+            # ${VAR} lets passwords stay in .env instead of the cameras file.
+            url=_resolve_url(os.path.expandvars(str(c["url"]))),
+            name=c.get("name", f"Camera {i}"),
+            branch_id=int(c.get("branch_id", BRANCH_ID)),
+            line_y=int(c.get("line_y", LINE_Y)),
+            enter_side=enter_side,
+        ))
+    ids = [c.id for c in cameras]
+    if len(ids) != len(set(ids)):
+        raise ValueError(f"duplicate camera ids in {CAMERAS_FILE}: {ids}")
+    if not cameras:
+        raise ValueError(f"no enabled cameras in {CAMERAS_FILE}")
+    return cameras
+
+
+def _mask_url(url: str):
+    """Hides the password in rtsp://user:pass@host URLs for logs."""
+    if "@" in url and "://" in url:
+        scheme, rest = url.split("://", 1)
+        creds, host = rest.split("@", 1)
+        return f"{scheme}://{creds.split(':', 1)[0]}:***@{host}"
+    return url
 
 
 def _parse_thresholds(spec: str):
@@ -62,12 +130,17 @@ def _parse_thresholds(spec: str):
 
 
 class ReturnGallery:
-    """Short-lived memory of people who recently exited, used to recognise them on re-entry."""
+    """Short-lived memory of people who recently exited, used to recognise them on re-entry.
+
+    Shared by all cameras of the process, so someone leaving through one door and coming back
+    through another is still recognised. Thread-safe.
+    """
 
     def __init__(self, ttl_sec: float, thresholds):
         self.ttl_sec = ttl_sec
         self.thresholds = thresholds
         self.entries = {}  # visitor_id -> (embedding, exit_time)
+        self.lock = threading.Lock()
 
     def _threshold(self, away_sec: float):
         for max_away, sim in self.thresholds:
@@ -75,125 +148,193 @@ class ReturnGallery:
                 return sim
         return None  # away longer than the last step -> treat as a new visit
 
-    def prune(self, now: float):
+    def _prune(self, now: float):
         self.entries = {v: e for v, e in self.entries.items() if now - e[1] <= self.ttl_sec}
 
+    def prune(self, now: float):
+        with self.lock:
+            self._prune(now)
+
     def add(self, visitor_id: int, embedding: np.ndarray, now: float):
-        self.entries[visitor_id] = (embedding, now)
+        with self.lock:
+            self.entries[visitor_id] = (embedding, now)
 
     def match(self, embedding: np.ndarray, now: float):
         """Returns (visitor_id, similarity) of the best match above its time-based threshold, else (None, best_sim)."""
-        self.prune(now)
-        best_id, best_match_sim, best_sim = None, -1.0, -1.0
-        for visitor_id, (emb, exit_time) in self.entries.items():
-            sim = float(np.dot(embedding, emb))
-            best_sim = max(best_sim, sim)
-            threshold = self._threshold(now - exit_time)
-            if threshold is not None and sim >= threshold and sim > best_match_sim:
-                best_id, best_match_sim = visitor_id, sim
-        if best_id is not None:
-            best_sim = best_match_sim
-            del self.entries[best_id]  # one exit can be matched by one entry only
-        return best_id, best_sim
+        with self.lock:
+            self._prune(now)
+            best_id, best_match_sim, best_sim = None, -1.0, -1.0
+            for visitor_id, (emb, exit_time) in self.entries.items():
+                sim = float(np.dot(embedding, emb))
+                best_sim = max(best_sim, sim)
+                threshold = self._threshold(now - exit_time)
+                if threshold is not None and sim >= threshold and sim > best_match_sim:
+                    best_id, best_match_sim = visitor_id, sim
+            if best_id is not None:
+                best_sim = best_match_sim
+                del self.entries[best_id]  # one exit can be matched by one entry only
+            return best_id, best_sim
 
 
-reid_encoder = ReID(REID_MODEL)  # also used for track stitching, so it is always loaded
 gallery = ReturnGallery(REID_TTL_MIN * 60, _parse_thresholds(REID_THRESHOLDS))
 
+# Person ids are global for the process: two cameras must never report different people under the same id.
+_pid_counter = itertools.count(1)
+_pid_lock = threading.Lock()
+
+
+def next_person_id():
+    with _pid_lock:
+        return next(_pid_counter)
+
+
 # Events are sent in the background so a slow API never stalls video processing.
-_event_executor = ThreadPoolExecutor(max_workers=2)
+_event_executor = ThreadPoolExecutor(max_workers=4)
 
 
-def _post_event(payload: dict):
+def _post_event(payload: dict, tag: str):
     try:
         response = requests.post(f"{API_URL}/events/", json=payload, timeout=API_TIMEOUT)
         response.raise_for_status()
-        print(f"Event sent successfully: {payload}")
+        print(f"{tag} Event sent successfully: {payload}")
     except requests.exceptions.RequestException as e:
-        print(f"Failed to send event to API: {e}")
+        print(f"{tag} Failed to send event to API: {e}")
 
 
-def send_event(person_id: int, action: str, returning: bool = False):
+def send_event(camera: CameraConfig, person_id: int, action: str, returning: bool = False):
     """Queues an event ("ENTER" or "EXIT") for the backend API.
 
     person_id is an anonymous visitor id that survives a short exit/re-entry (see ReID),
     so counting distinct person_id values gives the number of visits.
     """
     payload = {
-        "branch_id": BRANCH_ID,
+        "branch_id": camera.branch_id,
         "person_id": person_id,
         "action": action,
         "timestamp": time.time(),
         "returning": returning,
     }
-    _event_executor.submit(_post_event, payload)
+    _event_executor.submit(_post_event, payload, f"[{camera.id}]")
 
 
-app = Flask(__name__)
+class FrameHub:
+    """Latest annotated frame of one camera, shared with MJPEG clients and the preview window."""
 
-# Latest encoded JPEG shared with stream clients; the condition wakes them on each new frame.
-_frame_cond = threading.Condition()
-_frame_jpeg = None
-_frame_seq = 0
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.jpeg = None
+        self.frame = None
+        self.seq = 0
+
+    def publish(self, frame):
+        ok, buffer = cv2.imencode('.jpg', frame)
+        if not ok:
+            return
+        with self.cond:
+            self.frame = frame
+            self.jpeg = buffer.tobytes()
+            self.seq += 1
+            self.cond.notify_all()
+
+    def mjpeg(self):
+        last_seq = 0
+        min_interval = 1.0 / STREAM_MAX_FPS if STREAM_MAX_FPS > 0 else 0
+        last_sent = 0.0
+        while True:
+            with self.cond:
+                # Wait for a frame newer than the one already sent to this client.
+                self.cond.wait_for(lambda: self.seq != last_seq, timeout=1.0)
+                if self.seq == last_seq or self.jpeg is None:
+                    continue
+                last_seq = self.seq
+                jpeg = self.jpeg
+
+            wait = min_interval - (time.time() - last_sent)
+            if wait > 0:
+                time.sleep(wait)
+            last_sent = time.time()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg + b'\r\n')
 
 
-def publish_frame(frame):
-    global _frame_jpeg, _frame_seq
-    ok, buffer = cv2.imencode('.jpg', frame)
-    if not ok:
-        return
-    with _frame_cond:
-        _frame_jpeg = buffer.tobytes()
-        _frame_seq += 1
-        _frame_cond.notify_all()
+class VideoSource:
+    """Reads frames from a camera, a webcam index or a video file.
 
+    Live sources are read in a background thread that keeps only the newest frame (so a slow detector
+    never lags behind real time) and reconnects with backoff when the stream drops.
+    Files are read sequentially, frame by frame, and end at EOF.
+    """
 
-def generate_frames():
-    last_seq = 0
-    min_interval = 1.0 / STREAM_MAX_FPS if STREAM_MAX_FPS > 0 else 0
-    last_sent = 0.0
-    while True:
-        with _frame_cond:
-            # Wait for a frame newer than the one already sent to this client.
-            _frame_cond.wait_for(lambda: _frame_seq != last_seq, timeout=1.0)
-            if _frame_seq == last_seq or _frame_jpeg is None:
+    def __init__(self, url: str, tag: str):
+        self.url = url
+        self.tag = tag
+        self.is_file = os.path.isfile(url)
+        self.online = False
+        self.stopped = threading.Event()
+        self._cond = threading.Condition()
+        self._frame = None
+        self._seq = 0
+        self._cap = None
+        if self.is_file:
+            self._cap = cv2.VideoCapture(url)
+            self.online = self._cap.isOpened()
+        else:
+            threading.Thread(target=self._reader, name=f"reader-{tag}", daemon=True).start()
+
+    def _open(self):
+        if self.url.isdigit():
+            return cv2.VideoCapture(int(self.url))
+        return cv2.VideoCapture(self.url, cv2.CAP_FFMPEG, [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, STREAM_TIMEOUT_MS,
+            cv2.CAP_PROP_READ_TIMEOUT_MSEC, STREAM_TIMEOUT_MS,
+        ])
+
+    def _reader(self):
+        delay = 1.0
+        while not self.stopped.is_set():
+            cap = self._open()
+            if not cap.isOpened():
+                cap.release()
+                print(f"{self.tag} Cannot open {_mask_url(self.url)}, retrying in {delay:.0f}s")
+                self.stopped.wait(delay)
+                delay = min(delay * 2, RECONNECT_MAX_SEC)
                 continue
-            last_seq = _frame_seq
-            jpeg = _frame_jpeg
+            print(f"{self.tag} Connected to {_mask_url(self.url)}")
+            self.online = True
+            delay = 1.0
+            while not self.stopped.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    print(f"{self.tag} Stream lost, reconnecting...")
+                    break
+                with self._cond:
+                    self._frame = frame
+                    self._seq += 1
+                    self._cond.notify_all()
+            self.online = False
+            cap.release()
 
-        wait = min_interval - (time.time() - last_sent)
-        if wait > 0:
-            time.sleep(wait)
-        last_sent = time.time()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + jpeg + b'\r\n')
+    def read(self, last_seq: int):
+        """Returns (seq, frame) of a frame newer than last_seq, or (last_seq, None) if none is ready yet
+        (live source waiting for reconnect). Returns (None, None) when the source has ended."""
+        if self.stopped.is_set():
+            return None, None
+        if self.is_file:
+            ok, frame = self._cap.read()
+            if not ok:
+                return None, None
+            return last_seq + 1, frame
+        with self._cond:
+            self._cond.wait_for(lambda: self._seq != last_seq or self.stopped.is_set(), timeout=1.0)
+            if self._seq == last_seq:
+                return last_seq, None
+            return self._seq, self._frame
 
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-
-def run_flask():
-    app.run(host='0.0.0.0', port=STREAM_PORT, debug=False, use_reloader=False, threaded=True)
-
-
-def side_of_line(center_y: int):
-    """Returns 'above', 'below' or None while inside the dead zone around the line."""
-    if center_y < LINE_Y - LINE_MARGIN:
-        return "above"
-    if center_y > LINE_Y + LINE_MARGIN:
-        return "below"
-    return None
-
-
-def embed_boxes(frame, boxes_xyxy):
-    """Returns one L2-normalised appearance embedding (or None) per xyxy box."""
-    if reid_encoder is None or len(boxes_xyxy) == 0:
-        return [None] * len(boxes_xyxy)
-    b = np.asarray(boxes_xyxy, dtype=np.float32)
-    xywh = np.stack([(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2, b[:, 2] - b[:, 0], b[:, 3] - b[:, 1]], axis=1)
-    return reid_encoder(frame, xywh)
+    def release(self):
+        self.stopped.set()
+        self.online = False
+        if self._cap is not None:
+            self._cap.release()
 
 
 @dataclass
@@ -215,17 +356,18 @@ class Person:
 
 
 class PersonRegistry:
-    """Maps tracker ids to stable people and stitches broken tracks back together by appearance."""
+    """Maps tracker ids of one camera to stable people and stitches broken tracks back together by appearance."""
 
-    def __init__(self):
+    def __init__(self, tag: str):
+        self.tag = tag
         self.people = {}       # pid -> Person
         self.by_track = {}     # tracker id -> Person
-        self.next_pid = 1
+        self.created = 0
         self.tracker_ids_seen = set()
 
     def _new_person(self, now):
-        person = Person(pid=self.next_pid, last_seen=now)
-        self.next_pid += 1
+        person = Person(pid=next_person_id(), last_seen=now)
+        self.created += 1
         self.people[person.pid] = person
         return person
 
@@ -258,7 +400,7 @@ class PersonRegistry:
             for t in [t for t, q in self.by_track.items() if q is p]:
                 del self.by_track[t]
             self.by_track[track_ids[i]] = p
-            print(f"ReID: track {track_ids[i]} continues person {p.pid} (sim={sim:.2f})")
+            print(f"{self.tag} ReID: track {track_ids[i]} continues person {p.pid} (sim={sim:.2f})")
 
         for i in new_tracks:
             if i not in claimed_tracks:
@@ -300,103 +442,255 @@ def draw_person(frame, box, person, now):
     cv2.putText(frame, status, (x1, y2 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
+def draw_offline(hub: FrameHub, camera: CameraConfig):
+    """Shows a placeholder instead of a frozen last frame while the camera is reconnecting."""
+    frame = np.zeros((360, 640, 3), dtype=np.uint8)
+    cv2.putText(frame, f"{camera.name}: NO SIGNAL", (30, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 230), 2)
+    cv2.putText(frame, "reconnecting...", (30, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+    hub.publish(frame)
+
+
+class CameraWorker(threading.Thread):
+    """Detection, tracking and line counting for one camera, in its own thread.
+
+    Each camera has its own YOLO model and ReID encoder: the tracker state lives inside the model
+    (persist=True), so sharing one model between cameras would mix up their tracks.
+    """
+
+    def __init__(self, camera: CameraConfig):
+        super().__init__(name=f"camera-{camera.id}", daemon=True)
+        self.camera = camera
+        self.tag = f"[{camera.id}]"
+        self.hub = FrameHub()
+        self.source = None
+        self.model = YOLO(MODEL_PATH)
+        self.reid = ReID(REID_MODEL)
+        self.registry = PersonRegistry(self.tag)
+        self.stopped = threading.Event()
+
+    @property
+    def online(self):
+        return self.source is not None and self.source.online
+
+    def stop(self):
+        self.stopped.set()
+        if self.source is not None:
+            self.source.stopped.set()  # the worker thread releases the capture itself (see run)
+
+    def side_of_line(self, center_y: int):
+        """Returns 'inside', 'outside' or None while inside the dead zone around the line."""
+        line_y = self.camera.line_y
+        if center_y < line_y - LINE_MARGIN:
+            side = "above"
+        elif center_y > line_y + LINE_MARGIN:
+            side = "below"
+        else:
+            return None
+        return "inside" if side == self.camera.enter_side else "outside"
+
+    def is_inside(self, center_y: int):
+        """Work zone: the 'inside' half of the frame, without the hysteresis margin."""
+        below = center_y > self.camera.line_y
+        return below if self.camera.enter_side == "below" else not below
+
+    def embed_boxes(self, frame, boxes_xyxy):
+        """Returns one L2-normalised appearance embedding (or None) per xyxy box."""
+        if len(boxes_xyxy) == 0:
+            return []
+        b = np.asarray(boxes_xyxy, dtype=np.float32)
+        xywh = np.stack([(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2, b[:, 2] - b[:, 0], b[:, 3] - b[:, 1]],
+                        axis=1)
+        return self.reid(frame, xywh)
+
+    def run(self):
+        try:
+            self._run()
+        except Exception as e:  # one broken camera must not take the others down
+            print(f"{self.tag} Worker crashed: {e!r}")
+            raise
+        finally:
+            if self.source is not None:
+                self.source.release()
+            print(f"{self.tag} Stopped: tracker issued {len(self.registry.tracker_ids_seen)} track ids, "
+                  f"shown as {self.registry.created} people after ReID stitching.")
+
+    def _run(self):
+        camera = self.camera
+        print(f"{self.tag} Starting '{camera.name}': {_mask_url(camera.url)}, line_y={camera.line_y}, "
+              f"enter_side={camera.enter_side}, branch={camera.branch_id}")
+        self.source = VideoSource(camera.url, self.tag)
+        if self.source.is_file and not self.source.online:
+            print(f"{self.tag} Error: could not open video file {camera.url}")
+            return
+
+        registry = self.registry
+        frame_idx = 0
+        seq = 0
+        last_cleanup = time.time()
+        offline_shown = False
+
+        while not self.stopped.is_set():
+            new_seq, frame = self.source.read(seq)
+            if new_seq is None:
+                break  # file ended or source released
+            if frame is None:
+                if not offline_shown and not self.source.online:
+                    draw_offline(self.hub, camera)
+                    offline_shown = True
+                continue
+            seq = new_seq
+            offline_shown = False
+            frame_idx += 1
+
+            # classes=0 -> only 'person'
+            results = self.model.track(frame, classes=0, persist=True, verbose=False, conf=0.25,
+                                       tracker=TRACKER_CONFIG)
+            annotated_frame = frame.copy()
+            cv2.line(annotated_frame, (0, camera.line_y), (annotated_frame.shape[1], camera.line_y), (0, 255, 0), 2)
+            cv2.putText(annotated_frame, camera.name, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            current_time = time.time()
+
+            if results[0].boxes.id is not None:
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                track_ids = results[0].boxes.id.int().cpu().tolist()
+
+                # Embeddings: always for tracks we haven't seen (needed for stitching), plus a periodic refresh.
+                refresh = frame_idx % REID_EVERY_N_FRAMES == 0
+                idx = [
+                    i for i, (b, t) in enumerate(zip(boxes, track_ids))
+                    if b[3] - b[1] >= REID_MIN_BOX_H and (refresh or t not in registry.by_track)
+                ]
+                feats = [None] * len(track_ids)
+                for i, feat in zip(idx, self.embed_boxes(frame, boxes[idx])):
+                    if feat is not None:
+                        feats[i] = feat / max(np.linalg.norm(feat), 1e-12)
+
+                people = registry.resolve(track_ids, feats, current_time)
+
+                for box, person in zip(boxes, people):
+                    center_y = int((box[1] + box[3]) // 2)
+
+                    # Work zone (inside the line = working)
+                    if self.is_inside(center_y):
+                        if person.work_since is None:
+                            person.work_since = current_time
+                    elif person.work_since is not None:
+                        person.work_total += current_time - person.work_since
+                        person.work_since = None
+
+                    # Line crossing with hysteresis + per-person cooldown
+                    side = self.side_of_line(center_y)
+                    if side is not None:
+                        if person.side is not None and side != person.side \
+                                and current_time - person.last_event >= EVENT_COOLDOWN:
+                            action = "ENTER" if side == "inside" else "EXIT"
+                            # Re-entering after an EXIT of the same (stitched) person is not a new visit.
+                            returning = action == "ENTER" and person.has_event
+                            if action == "ENTER" and not person.has_event and person.feat is not None:
+                                visitor_id, sim = gallery.match(person.feat, current_time)
+                                if visitor_id is not None:
+                                    print(f"{self.tag} ReID: person {person.pid} is returning visitor "
+                                          f"{visitor_id} (sim={sim:.2f})")
+                                    registry.rename(person, visitor_id)
+                                    person.returning = returning = True
+                            if action == "EXIT" and person.feat is not None:
+                                gallery.add(person.pid, person.feat, current_time)
+                            send_event(camera, person.pid, action, returning)
+                            person.has_event = True
+                            person.last_event = current_time
+                        person.side = side
+
+                    draw_person(annotated_frame, box, person, current_time)
+
+            # Forget people who have been gone for a while (keeps memory bounded on long streams).
+            if current_time - last_cleanup > 30:
+                last_cleanup = current_time
+                gallery.prune(current_time)
+                registry.prune(current_time)
+
+            self.hub.publish(annotated_frame)
+
+
+app = Flask(__name__)
+workers = {}  # camera id -> CameraWorker, in config order
+
+
+@app.route('/cameras')
+def list_cameras():
+    return jsonify([
+        {
+            "id": w.camera.id,
+            "name": w.camera.name,
+            "branch_id": w.camera.branch_id,
+            "online": w.online,
+            "running": w.is_alive(),
+            "stream": f"/video_feed/{w.camera.id}",
+        }
+        for w in workers.values()
+    ])
+
+
+@app.route('/video_feed')
+def video_feed():
+    """Stream of the first camera (kept for the existing frontend)."""
+    worker = next(iter(workers.values()))
+    return Response(worker.hub.mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/video_feed/<camera_id>')
+def camera_feed(camera_id):
+    worker = workers.get(camera_id)
+    if worker is None:
+        abort(404)
+    return Response(worker.hub.mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+def run_flask():
+    app.run(host='0.0.0.0', port=STREAM_PORT, debug=False, use_reloader=False, threaded=True)
+
+
+def _raise_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main():
-    cap = cv2.VideoCapture(int(RTSP_URL) if RTSP_URL.isdigit() else RTSP_URL)
-
-    if not cap.isOpened():
-        print("Error: Could not open video source.")
-        return
-
-    print(f"Starting Computer Vision module and MJPEG Stream on port {STREAM_PORT}...")
+    # docker stop / systemd send SIGTERM: shut down the same way as on Ctrl+C.
+    signal.signal(signal.SIGTERM, _raise_interrupt)
+    cameras = load_cameras()
+    print(f"Starting Computer Vision module with {len(cameras)} camera(s), MJPEG streams on port {STREAM_PORT}...")
     print(f"Detector: {MODEL_PATH}, tracker: {TRACKER_CONFIG}")
+
+    for camera in cameras:
+        workers[camera.id] = CameraWorker(camera)
     threading.Thread(target=run_flask, daemon=True).start()
+    for worker in workers.values():
+        worker.start()
 
-    registry = PersonRegistry()
-    frame_idx = 0
-    last_cleanup = time.time()
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_idx += 1
-
-        # classes=0 -> only 'person'
-        results = model.track(frame, classes=0, persist=True, verbose=False, conf=0.25, tracker=TRACKER_CONFIG)
-        annotated_frame = frame.copy()
-        cv2.line(annotated_frame, (0, LINE_Y), (annotated_frame.shape[1], LINE_Y), (0, 255, 0), 2)
-        current_time = time.time()
-
-        if results[0].boxes.id is not None:
-            boxes = results[0].boxes.xyxy.cpu().numpy()
-            track_ids = results[0].boxes.id.int().cpu().tolist()
-
-            # Embeddings: always for tracks we haven't seen (needed for stitching), plus a periodic refresh.
-            refresh = frame_idx % REID_EVERY_N_FRAMES == 0
-            idx = [
-                i for i, (b, t) in enumerate(zip(boxes, track_ids))
-                if b[3] - b[1] >= REID_MIN_BOX_H and (refresh or t not in registry.by_track)
-            ]
-            feats = [None] * len(track_ids)
-            for i, feat in zip(idx, embed_boxes(frame, boxes[idx])):
-                if feat is not None:
-                    feats[i] = feat / max(np.linalg.norm(feat), 1e-12)
-
-            people = registry.resolve(track_ids, feats, current_time)
-
-            for box, person in zip(boxes, people):
-                center_y = int((box[1] + box[3]) // 2)
-
-                # Work zone (below the line = working)
-                if center_y > LINE_Y:
-                    if person.work_since is None:
-                        person.work_since = current_time
-                elif person.work_since is not None:
-                    person.work_total += current_time - person.work_since
-                    person.work_since = None
-
-                # Line crossing with hysteresis + per-person cooldown
-                side = side_of_line(center_y)
-                if side is not None:
-                    if person.side is not None and side != person.side \
-                            and current_time - person.last_event >= EVENT_COOLDOWN:
-                        action = "ENTER" if side == "below" else "EXIT"
-                        # Re-entering after an EXIT of the same (stitched) person is not a new visit.
-                        returning = action == "ENTER" and person.has_event
-                        if action == "ENTER" and not person.has_event and person.feat is not None:
-                            visitor_id, sim = gallery.match(person.feat, current_time)
-                            if visitor_id is not None:
-                                print(f"ReID: person {person.pid} is returning visitor {visitor_id} (sim={sim:.2f})")
-                                registry.rename(person, visitor_id)
-                                person.returning = returning = True
-                        if action == "EXIT" and person.feat is not None:
-                            gallery.add(person.pid, person.feat, current_time)
-                        send_event(person.pid, action, returning)
-                        person.has_event = True
-                        person.last_event = current_time
-                    person.side = side
-
-                draw_person(annotated_frame, box, person, current_time)
-
-        # Forget people who have been gone for a while (keeps memory bounded on long streams).
-        if current_time - last_cleanup > 30:
-            last_cleanup = current_time
-            gallery.prune(current_time)
-            registry.prune(current_time)
-
-        publish_frame(annotated_frame)
-
-        if SHOW_WINDOW:
-            cv2.imshow("CompVision Edge Agent", annotated_frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+    try:
+        # GUI calls must stay on the main thread (macOS requirement), so the preview windows are drawn here.
+        shown_seq = {}
+        while any(w.is_alive() for w in workers.values()):
+            if not SHOW_WINDOW:
+                time.sleep(0.5)
+                continue
+            for w in workers.values():
+                with w.hub.cond:
+                    frame, seq = w.hub.frame, w.hub.seq
+                if frame is not None and shown_seq.get(w.camera.id) != seq:
+                    shown_seq[w.camera.id] = seq
+                    cv2.imshow(f"CompVision - {w.camera.name}", frame)
+            if cv2.waitKey(10) & 0xFF == ord('q'):
                 break
-
-    print(f"Stopped: tracker issued {len(registry.tracker_ids_seen)} track ids, "
-          f"shown as {registry.next_pid - 1} people after ReID stitching.")
-    cap.release()
-    if SHOW_WINDOW:
-        cv2.destroyAllWindows()
-    _event_executor.shutdown(wait=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for w in workers.values():
+            w.stop()
+        for w in workers.values():
+            w.join(timeout=5)
+        if SHOW_WINDOW:
+            cv2.destroyAllWindows()
+        _event_executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":

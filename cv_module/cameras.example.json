@@ -1,0 +1,22 @@
+[
+  {
+    "id": "entrance",
+    "name": "Вход",
+    "url": "rtsp://admin:${CAM_ENTRANCE_PASS}@192.168.1.64:554/Streaming/Channels/102",
+    "line_y": 300,
+    "enter_side": "below"
+  },
+  {
+    "id": "hall",
+    "name": "Зал",
+    "url": "rtsp://admin:${CAM_HALL_PASS}@192.168.1.65:554/Streaming/Channels/102",
+    "line_y": 250,
+    "enter_side": "above"
+  },
+  {
+    "id": "test-video",
+    "name": "Тестовое видео",
+    "url": "cafe-cctv.mp4",
+    "enabled": false
+  }
+]
