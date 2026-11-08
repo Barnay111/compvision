@@ -1,0 +1,26 @@
+# Secrets
+.env
+.env.*
+!.env.example
+# Real camera list may contain addresses/passwords; cameras.example.json is the template
+cv_module/cameras.json
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.bak
+
+# Node
+node_modules/
+
+# Models and test videos (large binaries)
+*.pt
+*.onnx
+*.mp4
+
+# OS / tools
+.DS_Store
+.claude/
+/?/

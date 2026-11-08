@@ -1,0 +1,18 @@
+# BoT-SORT tuned for a fixed CCTV camera at a doorway.
+# Compared with the ultralytics default it keeps IDs ~3x more stable on our test footage:
+# - no global motion compensation: the camera doesn't move, and passing cars were mistaken for camera motion;
+# - appearance ReID inside the tracker to re-associate people after short occlusions;
+# - only confident detections may start a new track (flickering low-score boxes used to spawn new IDs);
+# - lost tracks are kept for ~5 s at 30 fps instead of 1 s.
+tracker_type: botsort
+track_high_thresh: 0.4
+track_low_thresh: 0.1
+new_track_thresh: 0.6
+track_buffer: 150
+match_thresh: 0.8
+fuse_score: True
+gmc_method: none
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: True
+model: yolo26n-reid.onnx

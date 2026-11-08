@@ -1,0 +1,8 @@
+opencv-python
+ultralytics
+requests
+python-dotenv
+numpy
+flask
+flask-cors
+onnxruntime
