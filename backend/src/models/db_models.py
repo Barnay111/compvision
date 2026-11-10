@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, Date, Float, Index, Integer, String
+from sqlalchemy import BigInteger, Boolean, Column, Date, Float, Index, Integer, String
 from src.core.database import Base
 
 class DBEmployee(Base):
@@ -15,10 +15,13 @@ class DBEvent(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     branch_id = Column(Integer, index=True)
-    person_id = Column(Integer, index=True)
+    # Unique across cv_module restarts (counted from the module's start time in ms), hence BIGINT.
+    person_id = Column(BigInteger, index=True)
     action = Column(String) # ENTER or EXIT
     timestamp = Column(Float)
     returning = Column("is_returning", Boolean, nullable=False, default=False, server_default="false")
+    # Set when the person was recognised as an employee by face; such events are not visitor visits.
+    employee_id = Column(Integer, nullable=True, index=True)
 
     __table_args__ = (Index("ix_cv_events_branch_ts", "branch_id", "timestamp"),)
 

@@ -5,7 +5,7 @@ import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 # RTSP over TCP: UDP drops packets on busy networks and the picture "smears". Must be set before cv2 opens a stream.
@@ -21,6 +21,8 @@ from ultralytics.trackers.utils.reid import ReID, smooth_feature
 
 load_dotenv()
 
+import faces as face_id  # noqa: E402  (reads its settings from the environment, so after load_dotenv)
+
 MODULE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 
 # Configuration
@@ -31,6 +33,10 @@ CAMERAS_FILE = os.getenv("CAMERAS_FILE", os.path.join(MODULE_DIR, "cameras.json"
 RTSP_URL = os.getenv("RTSP_URL", "0")  # 0 for webcam
 STREAM_PORT = int(os.getenv("STREAM_PORT", "5002"))
 MODEL_PATH = os.getenv("MODEL_PATH", "yolo26s.pt")
+# Detector input size. 640 is enough when people are large in the frame; 960 helps wide-angle cameras with
+# distant people (~+2-5% detections on test footage) at ~2x the compute. Can be overridden per camera.
+IMG_SIZE = int(os.getenv("IMG_SIZE", "640"))
+DETECT_CONF = float(os.getenv("DETECT_CONF", "0.25"))
 TRACKER_CONFIG = os.getenv("TRACKER_CONFIG", os.path.join(MODULE_DIR, "trackers", "botsort_cctv.yaml"))
 SHOW_WINDOW = os.getenv("SHOW_WINDOW", "1") == "1"
 
@@ -41,6 +47,9 @@ STREAM_TIMEOUT_MS = int(os.getenv("STREAM_TIMEOUT_MS", "10000"))
 
 # Line crossing settings (LINE_Y is the default for cameras that don't set their own line_y)
 LINE_Y = int(os.getenv("LINE_Y", "300"))
+# Which point of a person is compared with the line: "bottom" (feet) matches where the line is drawn on the floor;
+# "center" is the box centre, which for tall boxes near the camera sits far above the feet.
+LINE_ANCHOR = os.getenv("LINE_ANCHOR", "bottom")
 # Hysteresis: a person must move this many px past the line to count as being on the other side.
 LINE_MARGIN = int(os.getenv("LINE_MARGIN", "15"))
 # Minimum seconds between two events of the same track (suppresses jitter).
@@ -53,15 +62,32 @@ STREAM_MAX_FPS = float(os.getenv("STREAM_MAX_FPS", "25"))
 REID_MODEL = os.getenv("REID_MODEL", "yolo26n-reid.onnx")
 REID_TTL_MIN = float(os.getenv("REID_TTL_MIN", "30"))
 # "minutes:min_similarity" steps — the longer someone was away, the more similar they must look.
-REID_THRESHOLDS = os.getenv("REID_THRESHOLDS", "5:0.70,15:0.75,30:0.80")
+# Calibrated on test footage with yolo26n-reid: at 0.60 ~40% of returning people are recognised and ~6% of
+# matches pick the wrong person (a new visitor counted as returning). The old 0.70+ practically never matched.
+REID_THRESHOLDS = os.getenv("REID_THRESHOLDS", "5:0.60,15:0.63,30:0.66")
+# The best gallery match must beat the second best by this much, otherwise it is ambiguous and ignored.
+REID_MARGIN = float(os.getenv("REID_MARGIN", "0.05"))
+# Single-frame embeddings are too noisy to identify anyone (same person ~0.41 vs. others ~0.39 on test footage);
+# an average of a few clean frames is needed before a person is matched against or added to the gallery.
+REID_MIN_SAMPLES = int(os.getenv("REID_MIN_SAMPLES", "3"))
 REID_EVERY_N_FRAMES = int(os.getenv("REID_EVERY_N_FRAMES", "5"))
+# Quality gate for embeddings: crops of people partly hidden by someone else, cut by the frame edge or detected
+# with low confidence describe the wrong thing and spoil the running average. Skipping them raised correct
+# return matches on test footage from 43% to 93% (rank-1 among 7 people).
 REID_MIN_BOX_H = int(os.getenv("REID_MIN_BOX_H", "80"))  # smaller crops give unreliable embeddings
+REID_MIN_CONF = float(os.getenv("REID_MIN_CONF", "0.5"))
+REID_MAX_OVERLAP = float(os.getenv("REID_MAX_OVERLAP", "0.3"))  # share of the box covered by another person's box
+REID_BORDER_PX = int(os.getenv("REID_BORDER_PX", "4"))
 REID_EMA = float(os.getenv("REID_EMA", "0.9"))  # weight of the running average vs. the newest embedding
 # Track stitching: when the tracker loses someone (occlusion, missed detections) and starts a new track,
 # the new track inherits the ID of a person who vanished within REID_STITCH_SEC and looks similar enough.
 REID_STITCH_SEC = float(os.getenv("REID_STITCH_SEC", "10"))
 REID_STITCH_THRESH = float(os.getenv("REID_STITCH_THRESH", "0.72"))
 PERSON_FORGET_SEC = 120.0  # drop state of people not seen this long
+
+# Employee identification by face (see faces.py). Can be switched off per camera with "faces": false.
+FACES_ENABLED = os.getenv("FACES_ENABLED", "1") == "1"
+FACE_EVERY_N_FRAMES = int(os.getenv("FACE_EVERY_N_FRAMES", "3"))  # how often unidentified people are checked
 
 
 @dataclass
@@ -72,6 +98,9 @@ class CameraConfig:
     branch_id: int
     line_y: int
     enter_side: str  # "below" or "above": the side of the line that is "inside" (entering = crossing into it)
+    anchor: str = LINE_ANCHOR  # "bottom" (feet) or "center"
+    imgsz: int = IMG_SIZE
+    faces: bool = True  # identify employees by face on this camera
 
 
 def _resolve_url(url: str):
@@ -95,6 +124,9 @@ def load_cameras():
         enter_side = c.get("enter_side", "below")
         if enter_side not in ("below", "above"):
             raise ValueError(f"camera {c.get('id')}: enter_side must be 'below' or 'above'")
+        anchor = c.get("anchor", LINE_ANCHOR)
+        if anchor not in ("bottom", "center"):
+            raise ValueError(f"camera {c.get('id')}: anchor must be 'bottom' or 'center'")
         cameras.append(CameraConfig(
             id=str(c.get("id", f"cam{i}")),
             # ${VAR} lets passwords stay in .env instead of the cameras file.
@@ -103,6 +135,9 @@ def load_cameras():
             branch_id=int(c.get("branch_id", BRANCH_ID)),
             line_y=int(c.get("line_y", LINE_Y)),
             enter_side=enter_side,
+            anchor=anchor,
+            imgsz=int(c.get("imgsz", IMG_SIZE)),
+            faces=bool(c.get("faces", True)),
         ))
     ids = [c.id for c in cameras]
     if len(ids) != len(set(ids)):
@@ -163,23 +198,29 @@ class ReturnGallery:
         """Returns (visitor_id, similarity) of the best match above its time-based threshold, else (None, best_sim)."""
         with self.lock:
             self._prune(now)
-            best_id, best_match_sim, best_sim = None, -1.0, -1.0
+            scored = []
             for visitor_id, (emb, exit_time) in self.entries.items():
-                sim = float(np.dot(embedding, emb))
-                best_sim = max(best_sim, sim)
-                threshold = self._threshold(now - exit_time)
-                if threshold is not None and sim >= threshold and sim > best_match_sim:
-                    best_id, best_match_sim = visitor_id, sim
-            if best_id is not None:
-                best_sim = best_match_sim
-                del self.entries[best_id]  # one exit can be matched by one entry only
+                scored.append((float(np.dot(embedding, emb)), visitor_id, exit_time))
+            if not scored:
+                return None, -1.0
+            scored.sort(reverse=True)
+            best_sim, best_id, exit_time = scored[0]
+            second_sim = scored[1][0] if len(scored) > 1 else -1.0
+            threshold = self._threshold(now - exit_time)
+            # Only the overall best match may be accepted: if it is too close to the runner-up the two people
+            # look alike and picking either would be a guess.
+            if threshold is None or best_sim < threshold or best_sim - second_sim < REID_MARGIN:
+                return None, best_sim
+            del self.entries[best_id]  # one exit can be matched by one entry only
             return best_id, best_sim
 
 
 gallery = ReturnGallery(REID_TTL_MIN * 60, _parse_thresholds(REID_THRESHOLDS))
 
-# Person ids are global for the process: two cameras must never report different people under the same id.
-_pid_counter = itertools.count(1)
+# Person ids must never repeat: two cameras must not report different people under the same id, and neither may
+# a restarted process (the backend links employees to events by person_id). Counting from the start time in ms
+# guarantees that as long as fewer than 1000 people per second appear. On screen only the last 4 digits are shown.
+_pid_counter = itertools.count(int(time.time() * 1000))
 _pid_lock = threading.Lock()
 
 
@@ -201,11 +242,13 @@ def _post_event(payload: dict, tag: str):
         print(f"{tag} Failed to send event to API: {e}")
 
 
-def send_event(camera: CameraConfig, person_id: int, action: str, returning: bool = False):
+def send_event(camera: CameraConfig, person_id: int, action: str, returning: bool = False,
+               employee_id: Optional[int] = None):
     """Queues an event ("ENTER" or "EXIT") for the backend API.
 
     person_id is an anonymous visitor id that survives a short exit/re-entry (see ReID),
     so counting distinct person_id values gives the number of visits.
+    employee_id is set when the person was recognised as an employee by face.
     """
     payload = {
         "branch_id": camera.branch_id,
@@ -213,8 +256,24 @@ def send_event(camera: CameraConfig, person_id: int, action: str, returning: boo
         "action": action,
         "timestamp": time.time(),
         "returning": returning,
+        "employee_id": employee_id,
     }
     _event_executor.submit(_post_event, payload, f"[{camera.id}]")
+
+
+def _post_identify(payload: dict, tag: str):
+    try:
+        response = requests.post(f"{API_URL}/events/identify", json=payload, timeout=API_TIMEOUT)
+        response.raise_for_status()
+        print(f"{tag} Identified: {payload} -> {response.json()}")
+    except requests.exceptions.RequestException as e:
+        print(f"{tag} Failed to send identification to API: {e}")
+
+
+def send_identify(camera: CameraConfig, person_id: int, employee_id: int):
+    """Tells the backend that person_id is an employee, so events sent before the face was seen get linked too."""
+    payload = {"branch_id": camera.branch_id, "person_id": person_id, "employee_id": employee_id}
+    _event_executor.submit(_post_identify, payload, f"[{camera.id}]")
 
 
 class FrameHub:
@@ -343,16 +402,25 @@ class Person:
     pid: int                              # stable anonymous id: shown on video and sent to the API
     last_seen: float
     feat: Optional[np.ndarray] = None     # smoothed appearance embedding (RAM only)
+    feat_n: int = 0                       # number of clean embeddings averaged into feat
     side: Optional[str] = None            # last confirmed side of the line
     last_event: float = 0.0
     has_event: bool = False
     returning: bool = False
     work_total: float = 0.0
     work_since: Optional[float] = None
+    employee_id: Optional[int] = None     # set once the face was recognised as an employee
+    face_votes: dict = field(default_factory=dict)  # employee_id -> frames where the face matched them
 
     def update_feat(self, feat):
         if feat is not None:
             _, self.feat = smooth_feature(feat, self.feat, REID_EMA)
+            self.feat_n += 1
+
+    @property
+    def reliable_feat(self):
+        """The appearance embedding if it is averaged over enough clean frames to identify the person."""
+        return self.feat if self.feat_n >= REID_MIN_SAMPLES else None
 
 
 class PersonRegistry:
@@ -428,12 +496,16 @@ class PersonRegistry:
         self.by_track = {t: p for t, p in self.by_track.items() if p.pid not in stale}
 
 
-def draw_person(frame, box, person, now):
+def draw_person(frame, box, person, now, employee_name=None):
     x1, y1, x2, y2 = map(int, box)
     working = person.work_since is not None
     color = (0, 200, 0) if working else (0, 0, 230)
     worked = person.work_total + (now - person.work_since if working else 0)
-    label = f"ID {person.pid}" + (" RETURN" if person.returning else "")
+    if employee_name is not None:
+        label = f"STAFF {employee_name}"
+        color = (230, 140, 0) if working else (150, 90, 0)  # blue: employees
+    else:
+        label = f"ID {person.pid % 10000:04d}" + (" RETURN" if person.returning else "")
     status = f"{'WORKING' if working else 'IDLE'} | Work: {int(worked)}s"
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
@@ -457,7 +529,7 @@ class CameraWorker(threading.Thread):
     (persist=True), so sharing one model between cameras would mix up their tracks.
     """
 
-    def __init__(self, camera: CameraConfig):
+    def __init__(self, camera: CameraConfig, face_gallery: Optional["face_id.FaceGallery"] = None):
         super().__init__(name=f"camera-{camera.id}", daemon=True)
         self.camera = camera
         self.tag = f"[{camera.id}]"
@@ -465,6 +537,8 @@ class CameraWorker(threading.Thread):
         self.source = None
         self.model = YOLO(MODEL_PATH)
         self.reid = ReID(REID_MODEL)
+        self.face_gallery = face_gallery if camera.faces else None
+        self.face_models = face_id.FaceModels() if self.face_gallery is not None else None
         self.registry = PersonRegistry(self.tag)
         self.stopped = threading.Event()
 
@@ -477,21 +551,67 @@ class CameraWorker(threading.Thread):
         if self.source is not None:
             self.source.stopped.set()  # the worker thread releases the capture itself (see run)
 
-    def side_of_line(self, center_y: int):
+    def anchor_y(self, box):
+        """The point of a person compared with the line: feet (box bottom) or box centre."""
+        return int(box[3]) if self.camera.anchor == "bottom" else int((box[1] + box[3]) // 2)
+
+    def side_of_line(self, y: int):
         """Returns 'inside', 'outside' or None while inside the dead zone around the line."""
         line_y = self.camera.line_y
-        if center_y < line_y - LINE_MARGIN:
+        if y < line_y - LINE_MARGIN:
             side = "above"
-        elif center_y > line_y + LINE_MARGIN:
+        elif y > line_y + LINE_MARGIN:
             side = "below"
         else:
             return None
         return "inside" if side == self.camera.enter_side else "outside"
 
-    def is_inside(self, center_y: int):
+    def is_inside(self, y: int):
         """Work zone: the 'inside' half of the frame, without the hysteresis margin."""
-        below = center_y > self.camera.line_y
+        below = y > self.camera.line_y
         return below if self.camera.enter_side == "below" else not below
+
+    @staticmethod
+    def crop_quality(boxes, confs, frame_shape):
+        """Returns two masks over boxes:
+        - clean: the crop shows one whole, confidently detected person (for appearance ReID, see REID_MAX_OVERLAP);
+        - alone: the box isn't covered by someone else, so a face found in it belongs to this person.
+          Unlike `clean`, it allows boxes cut by the frame edge: people walking up to the camera are cut at the
+          bottom exactly when their face is largest."""
+        h, w = frame_shape[:2]
+        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        area = np.maximum((x2 - x1) * (y2 - y1), 1e-6)
+        iw = np.clip(np.minimum(x2[:, None], x2[None]) - np.maximum(x1[:, None], x1[None]), 0, None)
+        ih = np.clip(np.minimum(y2[:, None], y2[None]) - np.maximum(y1[:, None], y1[None]), 0, None)
+        covered = iw * ih / area[:, None]  # [i, j]: share of box i covered by box j
+        np.fill_diagonal(covered, 0)
+        b = REID_BORDER_PX
+        inside_frame = (x1 >= b) & (y1 >= b) & (x2 <= w - b) & (y2 <= h - b)
+        alone = covered.max(axis=1, initial=0) <= REID_MAX_OVERLAP
+        clean = (y2 - y1 >= REID_MIN_BOX_H) & (confs >= REID_MIN_CONF) & alone & inside_frame
+        return clean, alone
+
+    def identify_faces(self, frame, boxes, people, alone, frame_idx):
+        """Looks for faces of not yet identified people and votes for the employee they match."""
+        if self.face_gallery is None or len(self.face_gallery) == 0 or frame_idx % FACE_EVERY_N_FRAMES:
+            return
+        for box, person, ok in zip(boxes, people, alone):
+            if person.employee_id is not None or not ok:
+                continue
+            feat = face_id.find_face(self.face_models, frame, box)
+            if feat is None:
+                continue
+            employee_id, sim = self.face_gallery.match(feat)
+            if employee_id is None:
+                continue
+            votes = person.face_votes
+            votes[employee_id] = votes.get(employee_id, 0) + 1
+            others = sum(v for e, v in votes.items() if e != employee_id)
+            if votes[employee_id] >= face_id.FACE_VOTES and votes[employee_id] > 2 * others:
+                person.employee_id = employee_id
+                print(f"{self.tag} Face: person {person.pid} is employee {employee_id} "
+                      f"'{self.face_gallery.name(employee_id)}' (sim={sim:.2f}, votes={votes})")
+                send_identify(self.camera, person.pid, employee_id)
 
     def embed_boxes(self, frame, boxes_xyxy):
         """Returns one L2-normalised appearance embedding (or None) per xyxy box."""
@@ -517,7 +637,8 @@ class CameraWorker(threading.Thread):
     def _run(self):
         camera = self.camera
         print(f"{self.tag} Starting '{camera.name}': {_mask_url(camera.url)}, line_y={camera.line_y}, "
-              f"enter_side={camera.enter_side}, branch={camera.branch_id}")
+              f"enter_side={camera.enter_side}, anchor={camera.anchor}, imgsz={camera.imgsz}, "
+              f"branch={camera.branch_id}")
         self.source = VideoSource(camera.url, self.tag)
         if self.source.is_file and not self.source.online:
             print(f"{self.tag} Error: could not open video file {camera.url}")
@@ -543,8 +664,8 @@ class CameraWorker(threading.Thread):
             frame_idx += 1
 
             # classes=0 -> only 'person'
-            results = self.model.track(frame, classes=0, persist=True, verbose=False, conf=0.25,
-                                       tracker=TRACKER_CONFIG)
+            results = self.model.track(frame, classes=0, persist=True, verbose=False, conf=DETECT_CONF,
+                                       imgsz=camera.imgsz, tracker=TRACKER_CONFIG)
             annotated_frame = frame.copy()
             cv2.line(annotated_frame, (0, camera.line_y), (annotated_frame.shape[1], camera.line_y), (0, 255, 0), 2)
             cv2.putText(annotated_frame, camera.name, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
@@ -553,12 +674,14 @@ class CameraWorker(threading.Thread):
             if results[0].boxes.id is not None:
                 boxes = results[0].boxes.xyxy.cpu().numpy()
                 track_ids = results[0].boxes.id.int().cpu().tolist()
+                clean, alone = self.crop_quality(boxes, results[0].boxes.conf.cpu().numpy(), frame.shape)
 
-                # Embeddings: always for tracks we haven't seen (needed for stitching), plus a periodic refresh.
+                # Embeddings of clean crops only: always for tracks we haven't seen (needed for stitching),
+                # plus a periodic refresh.
                 refresh = frame_idx % REID_EVERY_N_FRAMES == 0
                 idx = [
-                    i for i, (b, t) in enumerate(zip(boxes, track_ids))
-                    if b[3] - b[1] >= REID_MIN_BOX_H and (refresh or t not in registry.by_track)
+                    i for i, t in enumerate(track_ids)
+                    if clean[i] and (refresh or t not in registry.by_track)
                 ]
                 feats = [None] * len(track_ids)
                 for i, feat in zip(idx, self.embed_boxes(frame, boxes[idx])):
@@ -566,12 +689,13 @@ class CameraWorker(threading.Thread):
                         feats[i] = feat / max(np.linalg.norm(feat), 1e-12)
 
                 people = registry.resolve(track_ids, feats, current_time)
+                self.identify_faces(frame, boxes, people, alone, frame_idx)
 
                 for box, person in zip(boxes, people):
-                    center_y = int((box[1] + box[3]) // 2)
+                    y = self.anchor_y(box)
 
                     # Work zone (inside the line = working)
-                    if self.is_inside(center_y):
+                    if self.is_inside(y):
                         if person.work_since is None:
                             person.work_since = current_time
                     elif person.work_since is not None:
@@ -579,34 +703,43 @@ class CameraWorker(threading.Thread):
                         person.work_since = None
 
                     # Line crossing with hysteresis + per-person cooldown
-                    side = self.side_of_line(center_y)
+                    side = self.side_of_line(y)
                     if side is not None:
                         if person.side is not None and side != person.side \
                                 and current_time - person.last_event >= EVENT_COOLDOWN:
                             action = "ENTER" if side == "inside" else "EXIT"
                             # Re-entering after an EXIT of the same (stitched) person is not a new visit.
                             returning = action == "ENTER" and person.has_event
-                            if action == "ENTER" and not person.has_event and person.feat is not None:
-                                visitor_id, sim = gallery.match(person.feat, current_time)
+                            feat = person.reliable_feat
+                            # Employees are known by face: the appearance gallery is for anonymous visitors only.
+                            is_employee = person.employee_id is not None
+                            if action == "ENTER" and not person.has_event and feat is not None and not is_employee:
+                                visitor_id, sim = gallery.match(feat, current_time)
                                 if visitor_id is not None:
                                     print(f"{self.tag} ReID: person {person.pid} is returning visitor "
                                           f"{visitor_id} (sim={sim:.2f})")
                                     registry.rename(person, visitor_id)
                                     person.returning = returning = True
-                            if action == "EXIT" and person.feat is not None:
-                                gallery.add(person.pid, person.feat, current_time)
-                            send_event(camera, person.pid, action, returning)
+                            if action == "EXIT" and feat is not None and not is_employee:
+                                gallery.add(person.pid, feat, current_time)
+                            send_event(camera, person.pid, action, returning, person.employee_id)
                             person.has_event = True
                             person.last_event = current_time
                         person.side = side
 
-                    draw_person(annotated_frame, box, person, current_time)
+                    employee_name = (self.face_gallery.name(person.employee_id)
+                                     if person.employee_id is not None and self.face_gallery is not None else None)
+                    draw_person(annotated_frame, box, person, current_time, employee_name)
+                    # The point that is compared with the line: helps to place line_y when setting up a camera.
+                    cv2.circle(annotated_frame, (int((box[0] + box[2]) / 2), y), 5, (0, 255, 255), -1)
 
             # Forget people who have been gone for a while (keeps memory bounded on long streams).
             if current_time - last_cleanup > 30:
                 last_cleanup = current_time
                 gallery.prune(current_time)
                 registry.prune(current_time)
+            if self.face_gallery is not None:
+                self.face_gallery.reload()  # picks up new employee photos without a restart
 
             self.hub.publish(annotated_frame)
 
@@ -660,8 +793,16 @@ def main():
     print(f"Starting Computer Vision module with {len(cameras)} camera(s), MJPEG streams on port {STREAM_PORT}...")
     print(f"Detector: {MODEL_PATH}, tracker: {TRACKER_CONFIG}")
 
+    face_gallery = None
+    if FACES_ENABLED and any(c.faces for c in cameras):
+        face_id.ensure_models()
+        face_gallery = face_id.FaceGallery(face_id.FaceModels())
+        if len(face_gallery) == 0:
+            print(f"Faces: no employee photos in {face_id.FACES_DIR} yet; everyone is counted as a visitor. "
+                  f"Add photos as faces/<employee_id>_<name>/*.jpg, they are picked up without a restart.")
+
     for camera in cameras:
-        workers[camera.id] = CameraWorker(camera)
+        workers[camera.id] = CameraWorker(camera, face_gallery)
     threading.Thread(target=run_flask, daemon=True).start()
     for worker in workers.values():
         worker.start()

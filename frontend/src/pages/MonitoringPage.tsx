@@ -54,7 +54,12 @@ export default function MonitoringPage() {
                     <div className={`w-2 h-2 rounded-full ${ev.action === 'ENTER' ? 'bg-green-500' : 'bg-red-500'}`}></div>
                     <div>
                       <p className="text-sm font-medium">
-                        Person #{ev.person_id}
+                        {ev.employee_id != null ? (
+                          <span className="text-sky-300">Staff #{ev.employee_id}</span>
+                        ) : (
+                          // person_id is unique across restarts (13 digits); the last 4 match the label on the video.
+                          <>Person #{String(ev.person_id).slice(-4)}</>
+                        )}
                         {ev.returning && <span className="ml-2 text-xs text-blue-300">returned</span>}
                       </p>
                       <p className="text-xs text-gray-400">{new Date(ev.timestamp * 1000).toLocaleTimeString()}</p>

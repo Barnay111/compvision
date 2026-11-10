@@ -10,6 +10,7 @@ export interface EventData {
   action: 'ENTER' | 'EXIT';
   timestamp: number;
   returning: boolean;
+  employee_id: number | null;
 }
 
 export interface DayPoint {

@@ -24,3 +24,7 @@ node_modules/
 .DS_Store
 .claude/
 /?/
+
+# Employee face photos are biometric personal data: never commit them
+cv_module/faces/
+FaceRecDemo/known_faces/
